@@ -80,6 +80,7 @@ function ensureLoadPhp(anyUrl) {
 
 function resolveRedirectToLoadPhp(currentBase, location) {
   const resolved = new URL(location, currentBase).toString()
+  return ensureLoadPhp(resolved)
 }
 
 function cacheKey(base, mac) { return `${base}|${mac}`.toLowerCase() }
@@ -243,6 +244,7 @@ function parsePackedId(id) {
   const portal = maybeDoubleDecode(encPortal) // e.g. "http://23232.top/server/load.php"
   let cmd = maybeDoubleDecode(encCmd)         // e.g. "ffmpeg http://23232.top:80/..."
   const mac = macRaw                          // e.g. "00:1A:79:74:8E:FB"
+
   // optional cleanup: some portals want the bare URL, some want the whole "ffmpeg <url>"
   const bareCmdUrl = cmd.startsWith('ffmpeg ') ? cmd.slice('ffmpeg '.length) : cmd
 
@@ -316,7 +318,7 @@ builder.defineStreamHandler(async ({ id }) => {
 
     console.log('create_link payload:', JSON.stringify(data, null, 2))
     console.log('extracted stream url:', finalUrl)
-
+    
     console.log('CMD is',cmd)
 
     //return { streams: finalUrl ? [{ url: finalUrl, title: 'Stalker Portal' }] : [] }
@@ -325,6 +327,9 @@ builder.defineStreamHandler(async ({ id }) => {
     console.error('Stream error:', e?.message)
     return { streams: [] }
   }
+})
+
+
 /* FIXED/RELAXED: meta handler always returns a meta for our prefix */
 builder.defineMetaHandler(async ({ type, id }) => {
   try {
@@ -397,6 +402,8 @@ builder.defineMetaHandler(async ({ type, id }) => {
 const iface = builder.getInterface()
 const app = express()
 app.use(express.urlencoded({ extended: true }))
+app.use(express.json())
+
 app.get('/', (req, res) => {
   const proto = req.socket.encrypted ? 'https' : 'http'
   const host = req.headers.host
@@ -538,3 +545,4 @@ if (SSL_KEY && SSL_CERT) {
 } else {
   app.listen(PORT, HOST, () => console.log(`🌐 HTTP on http://${HOST}:${PORT}/configure`))
 }
+
