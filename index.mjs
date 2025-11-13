@@ -22,7 +22,7 @@ const manifest = {
   description: 'Stremio add-on for Stalker/Ministra IPTV. Uses GET with StalkerTV-like headers & cookies.',
   resources: ['catalog', 'meta', 'stream'],
   types: ['tv'],
-  catalogs: [{ type: 'tv', id: 'stalker_live', name: 'Live TV (Stalker)', extraSupported: ['genre'], genres: ['News','Sports','Movies','Kids','Music','Documentary','Entertainment','Lifestyle','Regional','Religious','Educational','Other'] }],
+  catalogs: [{ type: 'tv', id: 'stalker_live', name: 'Live TV (Stalker)', extraSupported: ['genre'], genres: ['News','Sports','Movies','Kids','Music','Documentary','Entertainment','Lifestyle','Regional','Religious','Educational','Other']}],
   idPrefixes: ['stalker']
 }
 
@@ -177,57 +177,56 @@ async function doRequest({ portalUrl, mac, action, token, params, includeTokenPa
 }
 
 
-/* Return a normalized category for a channel */
-function channelCategory(ch) {
-  const candidates = [
-    ch.category, ch.cat, ch.group, ch.genre, ch.tv_genre, ch.tv_genre_id, ch.type, ch.group_name
-  ].filter(Boolean).map(x => String(x).trim())
-
-  let c = candidates[0] || ''
-  // try known keys inside objects
-  if (typeof ch === 'object') {
-    if (!c && ch.hasOwnProperty('categ') && ch.categ) c = String(ch.categ).trim()
-    if (!c && ch.hasOwnProperty('tv_genre_title') && ch.tv_genre_title) c = String(ch.tv_genre_title).trim()
-  }
-
-  c = (c || '').toLowerCase()
-  // normalize a few common variants
-  const map = {
-    'sport': 'Sports', 'sports': 'Sports',
-    'news': 'News',
-    'movie': 'Movies', 'movies': 'Movies', 'cinema': 'Movies',
-    'kids': 'Kids', 'children': 'Kids', 'cartoon': 'Kids',
-    'music': 'Music',
-    'doc': 'Documentary', 'documentary': 'Documentary',
-    'entertainment': 'Entertainment',
-    'lifestyle': 'Lifestyle',
-    'religion': 'Religious', 'religious': 'Religious',
-    'edu': 'Educational', 'education': 'Educational',
-    'regional': 'Regional', 'local': 'Regional',
-  }
-  // exact match
-  if (map[c]) return map[c]
-  // contains-based heuristics
-  if (c.includes('sport')) return 'Sports'
-  if (c.includes('news')) return 'News'
-  if (c.includes('movie') || c.includes('cinema') || c == 'film') return 'Movies'
-  if (c.includes('kid') || c.includes('cartoon') || c.includes('child')) return 'Kids'
-  if (c.includes('music')) return 'Music'
-  if (c.includes('doc')) return 'Documentary'
-  if (c.includes('relig')) return 'Religious'
-  if (c.includes('educ')) return 'Educational'
-  if (c.includes('life')) return 'Lifestyle'
-  if (c.includes('region') || c=='hindi' || c=='tamil' || c=='telugu' || c=='malayalam' || c=='kannada') return 'Regional'
-
-  // channel name heuristics
-  const n = String(ch.name || '').toLowerCase()
-  if (n.includes('sports')) return 'Sports'
-//  if (n.endswith('hd') && 'news' in n) return 'News'  # minor fun rule, not essential
-if (n.endsWith('hd') && n.includes('news')) return 'News'; // minor fun rule, not essential
-
-  // fallback
-  return 'Other'
+/* ───────────── Enhanced Category normalization ───────────── */
+function _stripDiacritics(s) {
+  try { return s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); } catch { return s; }
 }
+function _cleanToken(s) {
+  return _stripDiacritics(String(s || '')).toLowerCase().replace(/[_\-]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+const _CAT_PATTERNS = [
+  [/news/, 'News'],
+  [/sport/, 'Sports'],
+  [/(movie|film|cinema)/, 'Movies'],
+  [/(kid|cartoon|child|animation)/, 'Kids'],
+  [/music|mtv|vh1/, 'Music'],
+  [/(doc|discovery|nat geo|history)/, 'Documentary'],
+  [/(entertainment|drama|series|variety)/, 'Entertainment'],
+  [/(life|food|travel|home|fashion)/, 'Lifestyle'],
+  [/(relig|quran|church|temple|faith)/, 'Religious'],
+  [/(educ|learn|knowledge)/, 'Educational'],
+  [/(hindi|tamil|telugu|malayalam|kannada|bengali|marathi|punjabi|gujarati|odia|urdu|regional|local)/, 'Regional']
+];
+function channelCategory(ch) {
+  const fields = ['category','cat','categ','group','group_name','genre','tv_genre','tv_genre_title','tv_genre_id','type'];
+  const candidates = [];
+  for (const k of fields) if (ch && ch[k]) candidates.push(ch[k]);
+  if (typeof ch === 'object') {
+    for (const k in ch) if (/genre|group|cat/i.test(k) && ch[k]) candidates.push(ch[k]);
+  }
+  candidates.push(ch.name || '');
+  for (const raw of candidates) {
+    const t = _cleanToken(raw);
+    for (const [rx, label] of _CAT_PATTERNS) if (rx.test(t)) return label;
+  }
+  return 'Other';
+}
+
+// Cache & manifest sync for dynamic genre discovery
+let _dynamicGenres = null;
+function updateDynamicGenres(list) {
+  try {
+    const set = new Set();
+    for (const ch of list) set.add(channelCategory(ch));
+    const genres = Array.from(set).filter(Boolean);
+    if (!genres.includes('Other')) genres.push('Other');
+    _dynamicGenres = genres;
+    if (manifest && manifest.catalogs && manifest.catalogs[0]) {
+      manifest.catalogs[0].genres = genres;
+    }
+  } catch (e) { console.warn('updateDynamicGenres failed:', e.message); }
+}
+
 /* ───────────────────────── Stalker API wrappers ───────────────────────── */
 async function handshake(baseUrl, mac) {
   return await doRequest({
@@ -314,26 +313,21 @@ builder.defineCatalogHandler(async ({ id, extra = {} }) => {
   try {
     const token = await getTokenFor(portal, mac)
     const channels = await getAllChannels(portal, mac, token)
-    let list = extractChannelList(channels)
-
-    // Filter by category (genre) if provided by Stremio UI
-    const reqGenre = (extra.genre || '').trim()
-    if (reqGenre) {
-      list = list.filter(ch => channelCategory(ch) === reqGenre)
-    }
+    let list = extractChannelList(channels);
+    updateDynamicGenres(list);
+    const reqGenre = (extra.genre || '').trim();
+    if (reqGenre) list = list.filter(ch => channelCategory(ch) === reqGenre);
 
     console.log(`✅ Extracted ${list.length} channels for catalog ${id}`)
-    const metas = list
-      .map(ch => ({
-        id: `stalker:${encodeURIComponent(portal)}|${mac}|${encodeURIComponent(ch.cmd || String(ch.id))}`,
-        type: 'tv',
-        name: ch.name || `CH ${ch.id}`,
-        poster: ch.logo || null,
-        description: ch.cmd || '',
-        genres: [channelCategory(ch)]
-      }))
-
-    return { metas }
+    const metas = list.map(ch => ({
+  id: `stalker:${encodeURIComponent(portal)}|${mac}|${encodeURIComponent(ch.cmd || String(ch.id))}`,
+  type: 'tv',
+  name: ch.name || `CH ${ch.id}`,
+  poster: ch.logo || null,
+  description: ch.cmd || '',
+  genres: [channelCategory(ch)]
+}))
+return { metas }
   } catch (e) {
     console.error('Catalog error:', e?.message)
     return { metas: [] }
@@ -605,3 +599,4 @@ if (SSL_KEY && SSL_CERT) {
 } else {
   app.listen(PORT, HOST, () => console.log(`🌐 HTTP on http://${HOST}:${PORT}/configure`))
 }
+
