@@ -545,4 +545,3 @@ if (SSL_KEY && SSL_CERT) {
 } else {
   app.listen(PORT, HOST, () => console.log(`🌐 HTTP on http://${HOST}:${PORT}/configure`))
 }
-
