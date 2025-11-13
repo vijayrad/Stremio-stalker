@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 
 const { addonBuilder, getRouter } = sdk
-
+dsfsdffsd
 /* ───────────────────────── Manifest ───────────────────────── */
 const manifest = {
   id: 'org.stalker.iptv',
