@@ -1,0 +1,36 @@
+# Caddy will terminate TLS (HTTPS) and reverse-proxy to the Node app.
+# Two modes:
+# 1) Public domain (Let's Encrypt): set DOMAIN to your DNS name and open ports 80/443.
+# 2) Local dev: DOMAIN not resolvable publicly → we fall back to self-signed TLS (tls internal).
+
+# Public domain block (automatic HTTPS via Let's Encrypt)
+{
+    # Global options (optional tuning)
+    email {env.EMAIL}
+}
+
+# If DOMAIN environment variable is set to a real domain, use it here
+{
+    # This section is a placeholder for global config; left intentionally minimal.
+}
+
+# Site for a real domain (if you run with DOMAIN=my.example.com)
+{
+    @hasDomain {env.DOMAIN} not empty
+}
+
+({env.DOMAIN}) {
+    @app path /*
+    reverse_proxy app:7100
+}
+
+# Fallback for local development: self-signed certs with tls internal
+:443 {
+    tls internal
+    reverse_proxy app:7100
+}
+
+# Also listen on HTTP and redirect to HTTPS in local/dev
+:80 {
+    redir https://{host}{uri}
+}

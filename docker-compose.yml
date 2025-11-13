@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - PORT=7100
+    expose:
+      - "7100"
+    # If your app needs to reach the internet via proxy, add env here.
+    # If your app writes files, add a volume here.
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Set to your real domain to enable public HTTPS via Let's Encrypt
+      - DOMAIN=localhost
+      # Optional: email for ACME (certificate) registration
+      - EMAIL=you@example.com
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
