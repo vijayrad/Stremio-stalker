@@ -193,7 +193,7 @@ async function getTvGenres(baseUrl, mac, token) {
     try {
       const r = await doRequest({
         portalUrl: baseUrl, mac, action, token,
-        params: {}, includeTokenParam: true, includePrehashParam: true, type: 'stb'
+        params: {}, includeTokenParam: true, includePrehashParam: true, type: 'itv'
       });
       const list = extractChannelList(r);
       if (Array.isArray(list) && list.length) return list;
