@@ -23,7 +23,7 @@ const manifest = {
   resources: ['catalog', 'meta', 'stream'],
   types: ['tv'],
   catalogs: [{ type: 'tv', id: 'stalker_live', name: 'Live TV (Stalker)' }],
-  idPrefixes: ['stalker:']
+  idPrefixes: ['stalker']
 }
 
 const builder = new addonBuilder(manifest)
@@ -80,7 +80,6 @@ function ensureLoadPhp(anyUrl) {
 
 function resolveRedirectToLoadPhp(currentBase, location) {
   const resolved = new URL(location, currentBase).toString()
-  return ensureLoadPhp(resolved)
 }
 
 function cacheKey(base, mac) { return `${base}|${mac}`.toLowerCase() }
@@ -129,7 +128,7 @@ async function stalkerGet({ base, mac, action, token, params = {}, includeTokenP
   const loadPhp = ensureLoadPhp(base)
   const url = `${loadPhp}?${q.toString()}`
   const res = await axios.get(url, {
-    timeout: 12000,
+    timeout: 96000,
     decompress: true,
     headers: {
       'Accept': '*/*',
@@ -193,7 +192,7 @@ async function getAllChannels(baseUrl, mac, token) {
 async function createLink(baseUrl, mac, token, cmd) {
   return await doRequest({
     portalUrl: baseUrl, mac, action: 'create_link',
-    token, params: { cmd }, includeTokenParam: true, includePrehashParam: false, type: 'stb'
+    token, params: { cmd }, includeTokenParam: true, includePrehashParam: false, type: 'itv'
   })
 }
 async function getTokenFor(baseUrl, mac) {
@@ -214,6 +213,46 @@ function ensureConfigured() {
 }
 
 /* ───────────────────────── Stremio Handlers ───────────────────────── */
+function safeDecodeOnce(s = '') {
+  try { return decodeURIComponent(s) } catch { return s }
+}
+
+function maybeDoubleDecode(s = '') {
+  // Some portals double-encode; decode at most twice to avoid mangling real '%'s
+  const once = safeDecodeOnce(s)
+  if (/%[0-9A-Fa-f]{2}/.test(once)) {
+    const twice = safeDecodeOnce(once)
+    return twice
+  }
+  return once
+}
+
+function parsePackedId(id) {
+  if (!id) throw new Error('Empty id')
+  const PREFIX = 'stalker:'
+  const raw = id.startsWith(PREFIX) ? id.slice(PREFIX.length) : id
+
+  const parts = raw.split('|')
+  if (parts.length !== 3) {
+    throw new Error(`Bad id format, expected 3 parts, got ${parts.length}: ${raw}`)
+  }
+
+  const [encPortal, macRaw, encCmd] = parts
+
+  // decode the encoded segments; MAC stays as-is
+  const portal = maybeDoubleDecode(encPortal) // e.g. "http://23232.top/server/load.php"
+  let cmd = maybeDoubleDecode(encCmd)         // e.g. "ffmpeg http://23232.top:80/..."
+  const mac = macRaw                          // e.g. "00:1A:79:74:8E:FB"
+  // optional cleanup: some portals want the bare URL, some want the whole "ffmpeg <url>"
+  const bareCmdUrl = cmd.startsWith('ffmpeg ') ? cmd.slice('ffmpeg '.length) : cmd
+
+  // quick MAC sanity (warn only)
+  const macOk = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/.test(mac)
+  if (!macOk) console.warn('⚠️ Parsed MAC looks odd:', mac)
+
+  return { portal, mac, cmd, bareCmdUrl }
+}
+
 builder.defineCatalogHandler(async ({ id }) => {
   if (id !== 'stalker_live' || !ensureConfigured()) return { metas: [] }
   const portal = ensureLoadPhp(userConfig.portal_url)
@@ -242,28 +281,50 @@ builder.defineCatalogHandler(async ({ id }) => {
 /* FIXED: defineStreamHandler now defines portal/cmd before using them */
 builder.defineStreamHandler(async ({ id }) => {
   try {
-    console.log('🎬 Stream request for:', id)
-    if (!id.startsWith('stalker:') || !ensureConfigured()) return { streams: [] }
+    console.log('🎬 Stream request id:', id)
+    if (!id || !id.startsWith('stalker:')) return { streams: [] }
 
-    const [, rest] = id.split(':', 2)
-    const [encPortal, mac, encCmd] = rest.split('|')
-    const portal = decodeURIComponent(encPortal)
-    const cmd = decodeURIComponent(encCmd)
+    const { portal, mac, cmd, bareCmdUrl } = parsePackedId(id)
 
     console.log('  portal:', portal)
-    console.log('  mac:', mac)
-    console.log('  cmd:', cmd)
+    console.log('  mac   :', mac)
+    console.log('  cmd   :', cmd)
 
     const token = await getTokenFor(portal, mac)
-    const data = await createLink(portal, mac, token, cmd)
-    const streamUrl = data?.js?.cmd || data?.data?.cmd || data?.url || null
-    return { streams: streamUrl ? [{ url: streamUrl, title: 'Stalker Portal' }] : [] }
+    console.log(`Token is`,id)
+
+    // Most portals accept the full "cmd" you got in the list.
+    // If your portal requires only the URL part, swap 'cmd' → 'bareCmdUrl'.
+    //const data = await createLink(portal, mac, token, cmd /* or bareCmdUrl */)
+    const data = await createLink(portal, mac, token, bareCmdUrl )
+
+    const streamUrl =
+      data?.js?.cmd ||
+      data?.data?.cmd ||
+      data?.cmd ||
+      data?.url ||
+      (Array.isArray(data?.data?.playlist) ? data.data.playlist[0]?.url : null) ||
+      (Array.isArray(data?.js?.playlist) ? data.js.playlist[0]?.url : null)
+
+/*    const finalUrl = (typeof streamUrl === 'string' && streamUrl.startsWith('ffmpeg '))
+      ? streamUrl.slice('ffmpeg '.length)
+      : streamUrl */
+
+    const finalUrl = (typeof cmd === 'string' && cmd.startsWith('ffmpeg '))
+      ? cmd.slice('ffmpeg '.length)
+      : cmd
+
+    console.log('create_link payload:', JSON.stringify(data, null, 2))
+    console.log('extracted stream url:', finalUrl)
+
+    console.log('CMD is',cmd)
+
+    //return { streams: finalUrl ? [{ url: finalUrl, title: 'Stalker Portal' }] : [] }
+    return { streams: finalUrl ? [{ url: finalUrl, title: 'Stalker Portal' }] : [] }
   } catch (e) {
     console.error('Stream error:', e?.message)
     return { streams: [] }
   }
-})
-
 /* FIXED/RELAXED: meta handler always returns a meta for our prefix */
 builder.defineMetaHandler(async ({ type, id }) => {
   try {
@@ -336,8 +397,6 @@ builder.defineMetaHandler(async ({ type, id }) => {
 const iface = builder.getInterface()
 const app = express()
 app.use(express.urlencoded({ extended: true }))
-app.use(express.json())
-
 app.get('/', (req, res) => {
   const proto = req.socket.encrypted ? 'https' : 'http'
   const host = req.headers.host
@@ -479,4 +538,3 @@ if (SSL_KEY && SSL_CERT) {
 } else {
   app.listen(PORT, HOST, () => console.log(`🌐 HTTP on http://${HOST}:${PORT}/configure`))
 }
-
