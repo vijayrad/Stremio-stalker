@@ -259,9 +259,9 @@ const baseManifest = {
   name: 'Stalker IPTV (Prefetch Genres First)',
   description: 'Prefetches all channels once, then filters locally by genre; stable manifest with genres.',
   resources: ['catalog','meta','stream'],
-  types: ['tv'],
+  types: ['movie'],
   catalogs: [{
-    type: 'tv',
+    type: 'movie',
     id: 'stalker_live',
     name: 'Live TV (Stalker)',
     extraSupported: ['genre'],
@@ -444,7 +444,7 @@ function matchesGenreFactory(rec) {
 }
 
 builder.defineCatalogHandler(async ({ id, type = 'tv', extra = {}, skip = 0, limit = 100 }) => {
-  if (id !== 'stalker_live') { console.warn('[Catalog] Wrong id:', id, '(expected stalker_live)'); return { metas: [] } }
+  if (id !== 'stalker_live') { console.warn('[Catalog] Wrong id:', id, '(expected stalker_movies)'); return { metas: [] } }
   if (!ensureConfigured()) { console.warn('[Catalog] Not configured yet; returning empty metas.'); return { metas: [] } }
   if (!_genres || !_genres.length || _genreByTitle.size === 0) { try { await refreshGenres() } catch {} }
   if (!_channelsCache || !_channelsCache.length) { try { await refreshChannels() } catch {} }
@@ -465,7 +465,7 @@ builder.defineCatalogHandler(async ({ id, type = 'tv', extra = {}, skip = 0, lim
   if (!selected || /^(all|\*|none|false|null|undefined)$/i.test(selected)) {
     const metasAll = _channelsCache.map(ch => ({
       id: `stalker:${encodeURIComponent(ensureLoadPhp(userConfig.portal_url))}|${userConfig.mac}|${encodeURIComponent(ch.cmd || String(ch.id))}`,
-      type: 'tv', name: ch.name || `CH ${ch.id}`, poster: pickLogo(ch), description: ch.cmd || ''
+      type: 'movie', name: ch.name || `CH ${ch.id}`, poster: pickLogo(ch), description: ch.cmd || ''
     }))
     return { metas: metasAll.slice(s, s + l) }
   }
@@ -480,7 +480,7 @@ builder.defineCatalogHandler(async ({ id, type = 'tv', extra = {}, skip = 0, lim
 
   const metasAll = filtered.map(ch => ({
     id: `stalker:${encodeURIComponent(ensureLoadPhp(userConfig.portal_url))}|${userConfig.mac}|${encodeURIComponent(ch.cmd || String(ch.id))}`,
-    type: 'tv', name: ch.name || `CH ${ch.id}`, poster: pickLogo(ch), description: ch.cmd || '', genres: [rec.title]
+    type: 'movie', name: ch.name || `CH ${ch.id}`, poster: pickLogo(ch), description: ch.cmd || '', genres: [rec.title]
   }))
   const metas = metasAll.slice(s, s + l)
   console.log('[Catalog] Genre', rec.title, '→', metasAll.length, 'matches; returning', metas.length)
@@ -519,8 +519,8 @@ builder.defineMetaHandler(async ({ type, id }) => {
       const found = _channelsCache.find(ch => (ch?.cmd || String(ch?.id ?? '')) === cmd)
       if (found) { name = found.name || name; poster = found.logo || poster; if (!description && found.cmd) description = found.cmd }
     } catch (e) { console.warn('[META] enrichment from cache failed:', e?.message) }
-    return { meta: { id, type: 'tv', name, poster, description, logo: poster || null, background: poster || null, releaseInfo: 'Stalker IPTV' } }
-  } catch (e) { console.error('[META] error:', e?.message); return { meta: { id: id || '', type: 'tv', name: 'Live Channel', description: '' } } }
+    return { meta: { id, type: 'movie', name, poster, description, logo: poster || null, background: poster || null, releaseInfo: 'Stalker IPTV' } }
+  } catch (e) { console.error('[META] error:', e?.message); return { meta: { id: id || '', type: 'movie', name: 'Live Channel', description: '' } } }
 })
 
 // Expose builder interface
