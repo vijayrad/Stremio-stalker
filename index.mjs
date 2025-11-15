@@ -1,12 +1,15 @@
 #!/usr/bin/env node
-// Stremio ⇄ Stalker/Ministra IPTV Add-on
-// ESM • Web UI • Redirect handling • HTTPS-ready
+// Stremio ⇄ Stalker/Ministra IPTV Add-on (Genres-First) — ESM
+// Atomic manifest (stable during install), HTTPS ready, verbose logs.
+// - Serves /manifest.json from a pre-serialized string (no runtime mutation)
+// - Genres refreshed in background; swap manifest atomically when ready
+// - ASCII-only placeholder ("Loading...") and safe fallback
+// - Version bump only when genres actually change
 
 import sdk from 'stremio-addon-sdk'
 import axios from 'axios'
 import express from 'express'
 import fs from 'fs'
-import http from 'http'
 import https from 'https'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -14,164 +17,93 @@ import crypto from 'crypto'
 
 const { addonBuilder, getRouter } = sdk
 
-/* ───────────────────────── Manifest ───────────────────────── */
-const manifest = {
-  id: 'org.stalker.iptv',
-  version: '1.9.1',
-  name: 'Stalker IPTV (GET portal.php headers match)',
-  description: 'Stremio add-on for Stalker/Ministra IPTV. Uses GET with StalkerTV-like headers & cookies.',
-  resources: ['catalog', 'meta', 'stream'],
-  types: ['tv'],
-  catalogs: [{ type: 'tv', id: 'stalker_live', name: 'Live TV (Stalker)', extraSupported: ['genre'], genres: []}],
-  idPrefixes: ['stalker']
-}
-
-const builder = new addonBuilder(manifest)
-
-// Kick a background refresh shortly after boot (non-blocking)
-setTimeout(() => { refreshGenresFromPortal().catch(()=>{}); }, 1000);
-
-console.log('🧩 Add-on manifest loaded:')
-console.log('  id:', manifest.id)
-console.log('  idPrefixes:', manifest.idPrefixes)
-console.log('  resources:', manifest.resources)
-console.log('  catalogs:', manifest.catalogs.map(c => c.id).join(', '))
-console.log('--------------------------------------------------------')
-
-/* ───────────────────────── Config ───────────────────────── */
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const CONFIG_PATH = path.join(__dirname, 'config.json')
 
 let userConfig = {
-  portal_url: '',              // normalized to .../server/load.php
+  portal_url: '',
   mac: '',
   stb_lang: 'en_IN',
   timezone: 'Asia/Kolkata',
   user_agent: 'StalkerTV-Free/40304.13 CFNetwork/3860.200.31 Darwin/25.1.0',
   accept_language: 'en-IN,en-GB;q=0.9,en;q=0.8',
-  prehash: '',                 // optional
-  __cfduid: ''                 // persisted random
+  prehash: '',
+  __cfduid: ''
 }
 
 if (fs.existsSync(CONFIG_PATH)) {
   try { userConfig = { ...userConfig, ...JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) } } catch {}
 }
-function saveConfig() { fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2)) }
-if (!userConfig.__cfduid) { userConfig.__cfduid = crypto.randomBytes(16).toString('hex'); try { saveConfig() } catch {} }
+if (!userConfig.__cfduid) {
+  userConfig.__cfduid = crypto.randomBytes(16).toString('hex')
+  try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2)) } catch {}
+}
 
-/* ───────────────────────── Helpers ───────────────────────── */
-const tokenCache = new Map() // key: base|mac → { token, ts }
+function saveConfig() { try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2)) } catch {} }
+function ensureConfigured() {
+  const portal = (userConfig?.portal_url || '').trim()
+  const mac    = (userConfig?.mac || '').trim()
+  const ok = Boolean(portal && mac)
+  if (!ok) console.warn('[Config] portal_url/mac missing. Open /configure to set them.')
+  return ok
+}
 
+// ---------- Portal helpers ----------
 function ensureLoadPhp(anyUrl) {
-  const raw = (anyUrl || '').trim()
-  if (!raw) return ''
+  const raw = (anyUrl || '').trim(); if (!raw) return ''
   let base = raw.includes('://') ? raw : `http://${raw}`
-  const u = new URL(base)
-  let p = u.pathname.replace(/\/+$/, '')
-  if (p.endsWith('/server/load.php')) {
-    // ok
-  } else if (p.includes('/stalker_portal')) {
-    p = p.replace(/\/+$/, '') + '/server/load.php'
-  } else {
-    p = '/server/load.php'
-  }
-  u.pathname = p
-  u.search = ''
-  return u.toString().replace(/\/+$/, '')
+  const u = new URL(base); let p = u.pathname.replace(/\/+$/, '')
+  if (p.endsWith('/server/load.php')) { /* ok */ }
+  else if (p.includes('/stalker_portal')) { p = p.replace(/\/+$/, '') + '/server/load.php' }
+  else { p = '/server/load.php' }
+  u.pathname = p; u.search = ''; return u.toString().replace(/\/+$/, '')
 }
-
-function resolveRedirectToLoadPhp(currentBase, location) {
-  const resolved = new URL(location, currentBase).toString()
-  return ensureLoadPhp(resolved)
-}
-
-function cacheKey(base, mac) { return `${base}|${mac}`.toLowerCase() }
-
-function buildCookie(mac) {
-  const parts = [
-    `mac=${mac}`,
-    `stb_lang=${userConfig.stb_lang || 'en_IN'}`,
-    `timezone=${userConfig.timezone || 'Asia/Kolkata'}`,
-    `__cfduid=${userConfig.__cfduid}`
-  ]
-  return parts.join('; ')
-}
-
-function extractToken(hs) {
-  return hs?.token
-      || hs?.js?.token
-      || hs?.data?.token
-      || hs?.js?.data?.token
-      || null
-}
-
-/* Convenience to normalize different portal payload shapes to an array */
+function resolveRedirectToLoadPhp(currentBase, location) { const resolved = new URL(location, currentBase).toString(); return ensureLoadPhp(resolved) }
+function buildCookie(mac) { return [`mac=${mac}`, `stb_lang=${userConfig.stb_lang || 'en_IN'}`, `timezone=${userConfig.timezone || 'Asia/Kolkata'}`, `__cfduid=${userConfig.__cfduid}`].join('; ') }
+function extractToken(hs) { return hs?.token || hs?.js?.token || hs?.data?.token || hs?.js?.data?.token || null }
 function extractChannelList(resp) {
-  if (!resp) return []
-  if (Array.isArray(resp?.data)) return resp.data
-  if (Array.isArray(resp?.js?.data)) return resp.js.data
-  if (Array.isArray(resp?.js)) return resp.js
-  if (typeof resp?.js === 'string') {
-    try { const j = JSON.parse(resp.js); return Array.isArray(j?.data) ? j.data : (Array.isArray(j) ? j : []) } catch {}
+  if (!resp) return []; if (Array.isArray(resp?.data)) return resp.data; if (Array.isArray(resp?.js?.data)) return resp.js.data
+  if (Array.isArray(resp?.js)) return resp.js; if (typeof resp?.js === 'string') { try { const j = JSON.parse(resp.js); return Array.isArray(j?.data) ? j.data : (Array.isArray(j) ? j : []) } catch {} }
+  if (Array.isArray(resp)) return resp; return []
+}
+function pickList(r) {
+  const fromCommon = extractChannelList(r); if (Array.isArray(fromCommon) && fromCommon.length) return fromCommon
+  const candidates = [r?.data, r?.js?.data, r?.js, r?.result, r?.results, r?.genres, r?.categories]
+  for (const c of candidates) if (Array.isArray(c) && c.length) return c
+  if (typeof r?.js === 'string') { try { const j = JSON.parse(r.js); return pickList(j) } catch {} }
+  if (r && typeof r === 'object' && !Array.isArray(r)) {
+    const obj = r.data || r.js?.data || r.genres || r.categories || r
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      const entries = Object.entries(obj).map(([id, title]) => ({ id, title }))
+      if (entries.length) return entries
+    }
   }
-  if (Array.isArray(resp)) return resp
   return []
 }
 
-/* ───────────────────────── Core GET (with redirects) ───────────────────────── */
 async function stalkerGet({ base, mac, action, token, params = {}, includeTokenParam = true, includePrehashParam = true, type = 'stb' }) {
-  const q = new URLSearchParams()
-  q.set('type', type)
-  q.set('action', action)
+  const q = new URLSearchParams(); q.set('type', type); q.set('action', action)
   if (includeTokenParam) q.set('token', token || '')
   if (includePrehashParam && userConfig.prehash) q.set('prehash', userConfig.prehash)
-  q.set('JsHttpRequest', '1-xml')
-  for (const [k, v] of Object.entries(params || {})) if (v != null) q.set(k, String(v))
-
-  const loadPhp = ensureLoadPhp(base)
-  const url = `${loadPhp}?${q.toString()}`
+  q.set('JsHttpRequest', '1-xml'); for (const [k, v] of Object.entries(params || {})) if (v != null) q.set(k, String(v))
+  const loadPhp = ensureLoadPhp(base); const url = `${loadPhp}?${q.toString()}`
   const res = await axios.get(url, {
-    timeout: 96000,
-    decompress: true,
-    headers: {
-      'Accept': '*/*',
-      'User-Agent': userConfig.user_agent,
-      'Authorization': token ? `Bearer ${token}` : '',
-      'Accept-Language': userConfig.accept_language,
-      'Accept-Encoding': 'gzip, deflate',
-      'Cookie': buildCookie(mac)
-    },
-    maxRedirects: 0,
-    validateStatus: s => s >= 200 && s < 400
+    timeout: 96000, decompress: true,
+    headers: { 'Accept': '*/*', 'User-Agent': userConfig.user_agent, 'Authorization': token ? `Bearer ${token}` : '', 'Accept-Language': userConfig.accept_language, 'Accept-Encoding': 'gzip, deflate', 'Cookie': buildCookie(mac) },
+    maxRedirects: 0, validateStatus: s => s >= 200 && s < 400
   })
-
-  if (res.status >= 300 && res.status < 400 && res.headers?.location) {
-    return {
-      redirectTo: resolveRedirectToLoadPhp(loadPhp, res.headers.location),
-      permanent: (res.status === 301 || res.status === 308)
-    }
-  }
+  if (res.status >= 300 && res.status < 400 && res.headers?.location) return { redirectTo: resolveRedirectToLoadPhp(loadPhp, res.headers.location), permanent: (res.status === 301 || res.status === 308) }
   return { data: res.data }
 }
-
 async function doRequest({ portalUrl, mac, action, token, params, includeTokenParam = true, includePrehashParam = true, type = 'stb' }) {
-  let base = ensureLoadPhp(portalUrl)
-  if (!base) throw new Error('Invalid portal URL')
-
+  let base = ensureLoadPhp(portalUrl); if (!base) throw new Error('Invalid portal URL')
   for (let hop = 0; hop < 3; hop++) {
     const r = await stalkerGet({ base, mac, action, token, params, includeTokenParam, includePrehashParam, type })
     if (r.redirectTo) {
-      const old = base
-      base = ensureLoadPhp(r.redirectTo)
-      tokenCache.delete(cacheKey(old, mac))
-      if (r.permanent) {
-        userConfig.portal_url = base
-        try { saveConfig() } catch {}
-        console.log(`🔁 Permanent redirect: ${old} → ${base}`)
-      } else {
-        console.log(`↪️ Temporary redirect: ${old} → ${base}`)
-      }
+      const old = base; base = ensureLoadPhp(r.redirectTo); tokenCache.delete(`${old}|${mac}`.toLowerCase())
+      if (r.permanent) { userConfig.portal_url = base; saveConfig(); console.log(`🔁 Permanent redirect: ${old} → ${base}`) }
+      else { console.log(`↪️ Temporary redirect: ${old} → ${base}`) }
       continue
     }
     return r.data
@@ -179,449 +111,335 @@ async function doRequest({ portalUrl, mac, action, token, params, includeTokenPa
   throw new Error('Too many redirects contacting portal')
 }
 
-
-/* ───────────────────────── Stalker Genres (categories) helpers ───────────────────────── */
-// Cache of genres fetched from the portal: [{id, title}] and a quick maps
-let _stalkerGenres = null;          // array of { id, title }
-let _stalkerGenreById = new Map();  // id -> title
-let _stalkerGenreByName = new Map(); // lower(title) -> {id, title}
-
-// Query Stalker for genres: try both 'get_tv_genres' and 'get_genres' (some portals vary)
-async function getTvGenres(baseUrl, mac, token) {
-  const actions = ['get_tv_genres', 'get_genres'];
-  for (const action of actions) {
-    try {
-      const r = await doRequest({
-        portalUrl: baseUrl, mac, action, token,
-        params: {}, includeTokenParam: true, includePrehashParam: true, type: 'itv'
-      });
-      const list = extractChannelList(r);
-      if (Array.isArray(list) && list.length) return list;
-      // Some portals wrap under data directly
-      if (Array.isArray(r?.data)) return r.data;
-      if (Array.isArray(r?.js?.data)) return r.js.data;
-      if (Array.isArray(r?.js)) return r.js;
-    } catch (e) {
-      // try the next action name
-    }
-  }
-  return [];
-}
-
-function _normalizeName(s) {
-  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
-}
-
-function _loadGenreMaps(genres) {
-  _stalkerGenres = Array.isArray(genres) ? genres : [];
-  _stalkerGenreById = new Map();
-  _stalkerGenreByName = new Map();
-  for (const g of _stalkerGenres) {
-    const id = g.id ?? g.genre_id ?? g.tv_genre_id ?? g._id ?? g.value ?? g.val ?? g.ID;
-    const title = String(g.title ?? g.name ?? g.text ?? g.label ?? g.genre_title ?? g.tv_genre_title ?? '').trim();
-    if (id === undefined || !title) continue;
-    _stalkerGenreById.set(String(id), title);
-    _stalkerGenreByName.set(_normalizeName(title), { id: String(id), title });
-  }
-}
-
-// Fetch genres (once) and update manifest's static catalog genres list from the portal
-async function refreshGenresFromPortal() {
-  try {
-    if (!ensureConfigured()) return;
-    const portal = ensureLoadPhp(userConfig.portal_url);
-    const mac = userConfig.mac;
-    const token = await getTokenFor(portal, mac);
-    const genres = await getTvGenres(portal, mac, token);
-    _loadGenreMaps(genres);
-    if (manifest && Array.isArray(manifest.catalogs) && manifest.catalogs[0]) {
-      manifest.catalogs[0].genres = _stalkerGenres.map(g => (g.title ?? g.name ?? g.text ?? g.label ?? g.genre_title ?? g.tv_genre_title)).filter(Boolean);
-    }
-    console.log('[Genres] Loaded', _stalkerGenres.length, 'categories from portal');
-  } catch (e) {
-    console.warn('[Genres] Failed to load categories from portal:', e?.message);
-  }
-}
-
-// Try to wire refresh after server starts and whenever config changes
-
-/* ───────────────────────── Stalker API wrappers ───────────────────────── */
-async function handshake(baseUrl, mac) {
-  return await doRequest({
-    portalUrl: baseUrl, mac, action: 'handshake',
-    token: '', params: {}, includeTokenParam: true, includePrehashParam: true, type: 'stb'
-  })
-}
-async function getAllChannels(baseUrl, mac, token) {
-  // many portals require type=itv here; you already used that — keep it
-  return await doRequest({
-    portalUrl: baseUrl, mac, action: 'get_all_channels',
-    token, params: {}, includeTokenParam: false, includePrehashParam: false, type: 'itv'
-  })
-}
-async function createLink(baseUrl, mac, token, cmd) {
-  return await doRequest({
-    portalUrl: baseUrl, mac, action: 'create_link',
-    token, params: { cmd }, includeTokenParam: true, includePrehashParam: false, type: 'itv'
-  })
-}
+const tokenCache = new Map()
+async function handshake(baseUrl, mac) { return await doRequest({ portalUrl: baseUrl, mac, action: 'handshake', token: '', params: {}, includeTokenParam: true, includePrehashParam: true, type: 'stb' }) }
 async function getTokenFor(baseUrl, mac) {
-  const base = ensureLoadPhp(baseUrl)
-  const k = cacheKey(base, mac)
-  const cached = tokenCache.get(k)
-  if (cached && (Date.now() - cached.ts) < 20 * 60 * 1000 && cached.token) return cached.token
-  const hs = await handshake(base, mac)
-  const token = extractToken(hs)
-  console.log(`🔑 Handshake token:`, token)
-  if (!token) throw new Error(`Handshake failed: ${JSON.stringify(hs)}`)
-  tokenCache.set(k, { token, ts: Date.now() })
-  return token
+  const base = ensureLoadPhp(baseUrl); const key = `${base}|${mac}`.toLowerCase(); const cached = tokenCache.get(key)
+  if (cached && cached.token && (Date.now() - cached.ts) < 20 * 60 * 1000) return cached.token
+  const hs = await handshake(base, mac); const token = extractToken(hs); console.log('🔑 Handshake token:', token ? '[ok]' : '[missing]')
+  if (!token) throw new Error('Handshake failed; no token in response')
+  tokenCache.set(key, { token, ts: Date.now() }); return token
 }
 
-function ensureConfigured() {
-  return ensureLoadPhp(userConfig.portal_url) && (userConfig.mac || '').trim()
+// ---------- Genres cache & helpers ----------
+let _genres = null
+let _genreById = new Map()
+let _genreByTitle = new Map()
+function _gfNormName(s){ return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim() }
+function _gfGetId(g){ return String(g?.id ?? g?.genre_id ?? g?.tv_genre_id ?? g?._id ?? g?.value ?? g?.val ?? g?.ID ?? '').trim() }
+function _gfGetTitle(g){ return String(g?.title ?? g?.name ?? g?.text ?? g?.label ?? g?.genre_title ?? g?.tv_genre_title ?? '').trim() }
+
+async function getPortalGenres(baseUrl, mac, token) {
+  const actions = ['get_tv_genres', 'get_genres', 'get_categories']; const types = ['stb', 'itv']
+  for (const action of actions) for (const t of types) {
+    try { const r = await doRequest({ portalUrl: baseUrl, mac, action, token, params: {}, includeTokenParam: true, includePrehashParam: true, type: t })
+      const list = pickList(r); if (Array.isArray(list) && list.length) return list } catch {}
+  } console.warn('[Genres] No list from portal using any action/type.'); return []
+}
+function _loadGenres(genList) {
+  _genres = Array.isArray(genList) ? genList : []
+  _genreById = new Map(); _genreByTitle = new Map()
+  for (const g of _genres) { const id = _gfGetId(g); const title = _gfGetTitle(g); if (!id || !title) continue; _genreById.set(id, title); _genreByTitle.set(_gfNormName(title), { id, title }) }
 }
 
-/* ───────────────────────── Stremio Handlers ───────────────────────── */
-function safeDecodeOnce(s = '') {
-  try { return decodeURIComponent(s) } catch { return s }
-}
-
-function maybeDoubleDecode(s = '') {
-  // Some portals double-encode; decode at most twice to avoid mangling real '%'s
-  const once = safeDecodeOnce(s)
-  if (/%[0-9A-Fa-f]{2}/.test(once)) {
-    const twice = safeDecodeOnce(once)
-    return twice
-  }
-  return once
-}
-
-function parsePackedId(id) {
-  if (!id) throw new Error('Empty id')
-  const PREFIX = 'stalker:'
-  const raw = id.startsWith(PREFIX) ? id.slice(PREFIX.length) : id
-
-  const parts = raw.split('|')
-  if (parts.length !== 3) {
-    throw new Error(`Bad id format, expected 3 parts, got ${parts.length}: ${raw}`)
-  }
-
-  const [encPortal, macRaw, encCmd] = parts
-
-  // decode the encoded segments; MAC stays as-is
-  const portal = maybeDoubleDecode(encPortal) // e.g. "http://23232.top/server/load.php"
-  let cmd = maybeDoubleDecode(encCmd)         // e.g. "ffmpeg http://23232.top:80/..."
-  const mac = macRaw                          // e.g. "00:1A:79:74:8E:FB"
-
-  // optional cleanup: some portals want the bare URL, some want the whole "ffmpeg <url>"
-  const bareCmdUrl = cmd.startsWith('ffmpeg ') ? cmd.slice('ffmpeg '.length) : cmd
-
-  // quick MAC sanity (warn only)
-  const macOk = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/.test(mac)
-  if (!macOk) console.warn('⚠️ Parsed MAC looks odd:', mac)
-
-  return { portal, mac, cmd, bareCmdUrl }
-}
-
-builder.defineCatalogHandler(async ({ id, extra = {} }) => {
-  if (id !== 'stalker_live' || !ensureConfigured()) return { metas: [] }
-  const portal = ensureLoadPhp(userConfig.portal_url)
-  const mac = userConfig.mac
-  try {
-    const token = await getTokenFor(portal, mac)
-    const channels = await getAllChannels(portal, mac, token)
-    let list = extractChannelList(channels);
-
-// Ensure we have portal genres cached
-if (!_stalkerGenres) { await refreshGenresFromPortal().catch(()=>{}); }
-
-// Attach category name per channel using known id keys
-const genreIdOf = (ch) => {
-  const cand = [ch.genre_id, ch.tv_genre_id, ch.cat_id, ch.catid, ch.group_id, ch.groupid, ch.tv_genre, ch.category_id];
-  for (const v of cand) if (v !== undefined && v !== null && String(v).trim?.() !== '') return String(v);
-  return null;
+// ---------- Atomic manifest ----------
+const baseManifest = {
+  id: 'org.stalker.iptv',
+  version: '2.3.0',
+  name: 'Stalker IPTV (Genres First)',
+  description: 'Fetches genres from Stalker first; channels load only after a genre selection.',
+  resources: ['catalog','meta','stream'],
+  types: ['tv'],
+  catalogs: [{
+    type: 'tv',
+    id: 'stalker_live',
+    name: 'Live TV (Stalker)',
+    extraSupported: ['genre'],
+    // We don't require it so Discover can still show previews
+    // and users can open the catalog without picking first
+    genres: ['All','Loading...'],
+    extra: [{ name: 'genre', isRequired: false, options: ['All','Loading...'] }]
+  }],
+  idPrefixes: ['stalker']
 };
 
-const channelWithCategory = (ch) => {
-  const gid = genreIdOf(ch);
-  const title = gid && _stalkerGenreById.get(String(gid)) || null;
-  return { ch, __category: title || null };
-};
+// used by addonBuilder; static clone (doesn't need dynamic genres)
+const builderManifest = JSON.parse(JSON.stringify(baseManifest))
 
-let enriched = list.map(channelWithCategory);
+let cachedGenres = ['All','Loading...']                 // always non-empty
+let frozenManifestBody = JSON.stringify(baseManifest) // pre-serialized; what we serve
 
-// Filter if a genre is requested by name
-const reqName = String(extra.genre || '').trim().toLowerCase();
-if (reqName) {
-  enriched = enriched.filter(x => (x.__category || '').toLowerCase() === reqName);
+
+function rebuildManifestBody() {
+  // Build the options list that UI can display
+  const opts =
+    (cachedGenres && cachedGenres.length
+      ? (cachedGenres.includes('All') ? cachedGenres.slice(0) : ['All', ...cachedGenres])
+      : ['All']);
+
+  const manifest = {
+    ...baseManifest,
+    catalogs: [{
+      ...baseManifest.catalogs[0],
+      // Legacy field many clients still use for the sidebar
+      genres: opts,
+      // Ensure the catalog explicitly supports the param
+      extraSupported: ['genre'],
+      // Modern schema that some clients prefer for the sidebar
+      extra: [{ name: 'genre', isRequired: false, options: opts }]
+    }]
+  };
+
+  // Pre-serialize atomically (keeps manifest stable while installing)
+  frozenManifestBody = JSON.stringify(manifest);
 }
 
-// Replace list with only the channels (post-filter)
-list = enriched.map(x => x.ch)
+function maybeBumpVersion() {
+  const parts = String(baseManifest.version || '1.0.0').split('.').map(n => parseInt(n,10) || 0)
+  parts[2] = (parts[2] || 0) + 1
+  baseManifest.version = parts.join('.')
+  rebuildManifestBody()
+}
 
+// initial serialization
+rebuildManifestBody()
 
-    console.log(`✅ Extracted ${list.length} channels for catalog ${id}`)
-    const metas = list.map(ch => ({
-      id: `stalker:${encodeURIComponent(portal)}|${mac}|${encodeURIComponent(ch.cmd || String(ch.id))}`,
-      type: 'tv',
-      name: ch.name || `CH ${ch.id}`,
-      poster: ch.logo || null,
-      description: ch.cmd || '',
-      genres: [(function(){ 
-        const gid = (ch.genre_id ?? ch.tv_genre_id ?? ch.cat_id ?? ch.catid ?? ch.group_id ?? ch.groupid ?? ch.tv_genre ?? ch.category_id);
-        return gid != null && _stalkerGenreById.get(String(gid)) || 'Other';
-      })()]
-    }))
-
-    return { metas }
-  } catch (e) {
-    console.error('Catalog error:', e?.message)
-    return { metas: [] }
+async function refreshGenres() {
+  if (!ensureConfigured()) {
+    // keep placeholder; do not mutate manifest during request
+    return
   }
-})
+  const portal = ensureLoadPhp(userConfig.portal_url); const mac = userConfig.mac; const token = await getTokenFor(portal, mac)
+  console.log('[Genres] fetching from portal...')
+  const raw = await getPortalGenres(portal, mac, token); _loadGenres(raw)
 
-/* FIXED: defineStreamHandler now defines portal/cmd before using them */
-builder.defineStreamHandler(async ({ id }) => {
-  try {
-    console.log('🎬 Stream request id:', id)
-    if (!id || !id.startsWith('stalker:')) return { streams: [] }
+  const titles = _genres.map(g => _gfGetTitle(g)).filter(s => typeof s === 'string' && s.trim().length > 0)
+  const clean = titles.length ? (titles.includes('All') ? titles : ['All', ...titles]) : ['All','Loading...']
 
-    const { portal, mac, cmd, bareCmdUrl } = parsePackedId(id)
-
-    console.log('  portal:', portal)
-    console.log('  mac   :', mac)
-    console.log('  cmd   :', cmd)
-
-    const token = await getTokenFor(portal, mac)
-    console.log(`Token is`,id)
-
-    // Most portals accept the full "cmd" you got in the list.
-    // If your portal requires only the URL part, swap 'cmd' → 'bareCmdUrl'.
-    //const data = await createLink(portal, mac, token, cmd /* or bareCmdUrl */)
-    const data = await createLink(portal, mac, token, bareCmdUrl )
-
-    const streamUrl =
-      data?.js?.cmd ||
-      data?.data?.cmd ||
-      data?.cmd ||
-      data?.url ||
-      (Array.isArray(data?.data?.playlist) ? data.data.playlist[0]?.url : null) ||
-      (Array.isArray(data?.js?.playlist) ? data.js.playlist[0]?.url : null)
-
-/*    const finalUrl = (typeof streamUrl === 'string' && streamUrl.startsWith('ffmpeg '))
-      ? streamUrl.slice('ffmpeg '.length)
-      : streamUrl */
-
-    const finalUrl = (typeof cmd === 'string' && cmd.startsWith('ffmpeg '))
-      ? cmd.slice('ffmpeg '.length)
-      : cmd
-
-    console.log('create_link payload:', JSON.stringify(data, null, 2))
-    console.log('extracted stream url:', finalUrl)
-    
-    console.log('CMD is',cmd)
-
-    //return { streams: finalUrl ? [{ url: finalUrl, title: 'Stalker Portal' }] : [] }
-    return { streams: finalUrl ? [{ url: finalUrl, title: 'Stalker Portal' }] : [] }
-  } catch (e) {
-    console.error('Stream error:', e?.message)
-    return { streams: [] }
+  // swap only if changed to avoid needless bumps
+  if (JSON.stringify(clean) !== JSON.stringify(cachedGenres)) {
+    cachedGenres = clean
+    rebuildManifestBody()
+    maybeBumpVersion() // bump only on real change
+    console.log('[Genres] published count =', cachedGenres.length, 'example =', cachedGenres[0])
+  } else {
+    console.log('[Genres] unchanged (', cachedGenres.length, 'items )')
   }
-})
+}
 
-
-/* FIXED/RELAXED: meta handler always returns a meta for our prefix */
-builder.defineMetaHandler(async ({ type, id }) => {
-  try {
-    console.log('[META] hit:', { type, id })
-
-    if (!id) return { meta: null } // no id, nothing to do
-
-    // Accept both prefixed and non-prefixed ids; prefer our 'stalker:' prefix
-    const raw = id.startsWith('stalker:') ? id.slice('stalker:'.length) : id
-    const [encPortal = '', mac = '', encCmd = ''] = raw.split('|')
-
-    let portal = encPortal, cmd = encCmd
-    try { portal = decodeURIComponent(encPortal) } catch {}
-    try { cmd    = decodeURIComponent(encCmd) }    catch {}
-
-    // Always return a minimal meta so Stremio never sees meta=null
-    let name = 'Live Channel'
-    let poster = null
-    let description = cmd || ''
-
-    // Optional enrichment
-    try {
-      if (portal && mac) {
-        const token   = await getTokenFor(portal, mac)
-        const payload = await getAllChannels(portal, mac, token)
-        const arr = extractChannelList(payload)
-
-        // Match by cmd (preferred) or by id
-        const found = arr.find(ch => {
-          const chCmd = ch?.cmd || String(ch?.id ?? '')
-          return chCmd === cmd
-        })
-        if (found) {
-          name = found.name || name
-          poster = found.logo || poster
-          if (!description && found.cmd) description = found.cmd
-        }
-      }
-    } catch (e) {
-      console.warn('[META] enrichment failed:', e?.message)
-    }
-
-    return {
-      meta: {
-        id,
-        type: 'tv',                // force tv — some Stremio calls use odd types
-        name,
-        poster,
-        description,
-        logo: poster || null,
-        background: poster || null,
-        releaseInfo: 'Stalker IPTV'
-      }
-    }
-  } catch (e) {
-    console.error('[META] error:', e?.message)
-    // Last resort: still return a minimal meta so Stremio doesn’t bail
-    return {
-      meta: {
-        id,
-        type: 'tv',
-        name: 'Live Channel',
-        description: ''
-      }
-    }
-  }
-})
-
-/* ───────────────────────── Web UI & API ───────────────────────── */
-const iface = builder.getInterface()
+// ---------- Addon interface ----------
 const app = express()
 app.use(express.urlencoded({ extended: true }))
 app.use(express.json())
+app.use((req, _res, next) => { console.log('[HTTP]', req.method, req.url); next(); })
+
+// Serve manifest as a frozen string (atomic)
+app.get('/manifest.json', (_req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  res.end(frozenManifestBody)
+})
 
 app.get('/', (req, res) => {
-  const proto = req.socket.encrypted ? 'https' : 'http'
-  const host = req.headers.host
-  res.send(`
-    <h1>Stalker IPTV Add-on</h1>
-    <p><a href="${proto}://${host}/configure">Configure</a></p>
-    <p>Manifest URL: <code>${proto}://${host}/manifest.json</code></p>
-  `)
+  const proto = req.socket.encrypted ? 'https' : 'http'; const host = req.headers.host
+  res.send(`<h1>Stalker IPTV Add-on</h1>
+<p><a href="${proto}://${host}/configure">Configure</a></p>
+<p>Manifest URL: <code>${proto}://${host}/manifest.json</code></p>`)
 })
 
 app.get('/configure', (req, res) => {
-  const proto = req.socket.encrypted ? 'https' : 'http'
-  const host = req.headers.host
-  res.type('html').send(`
-    <!doctype html><meta charset="utf-8"><title>Configure Stalker Portal</title>
-    <style>
-      body{font-family:sans-serif;max-width:820px;margin:40px auto;padding:0 16px}
-      label{display:block;margin-top:10px}
-      input{width:100%;padding:8px}
-      button{margin-top:12px;padding:8px 14px}
-      .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    </style>
-    <h2>Stalker IPTV Configuration</h2>
-    <label>Portal URL</label>
-    <input id="portal" value="${userConfig.portal_url}" placeholder="http://host/stalker_portal/server/load.php" />
-    <div class="row">
-      <div>
-        <label>MAC Address</label>
-        <input id="mac" value="${userConfig.mac}" placeholder="00:1A:79:12:34:56" />
-      </div>
-      <div>
-        <label>Prehash (optional)</label>
-        <input id="prehash" value="${userConfig.prehash || ''}" placeholder="EF92F... (if required by portal)" />
-      </div>
-    </div>
-    <div class="row">
-      <div><label>stb_lang</label><input id="stb_lang" value="${userConfig.stb_lang}" placeholder="en_IN" /></div>
-      <div><label>timezone</label><input id="timezone" value="${userConfig.timezone}" placeholder="Asia/Kolkata" /></div>
-    </div>
-    <div class="row">
-      <div><label>User-Agent</label><input id="ua" value="${userConfig.user_agent}" /></div>
-      <div><label>Accept-Language</label><input id="al" value="${userConfig.accept_language}" /></div>
-    </div>
-    <div>
-      <button onclick="save()">Save</button>
-      <button onclick="test()">Test</button>
-    </div>
-    <pre id="out"></pre>
-    <p>Manifest URL: <code>${proto}://${host}/manifest.json</code></p>
-    <script>
-      const out = document.getElementById('out')
-      function show(m){ out.textContent = m }
-      async function save(){
-        const body = {
-          portal_url: document.getElementById('portal').value,
-          mac: document.getElementById('mac').value,
-          prehash: document.getElementById('prehash').value,
-          stb_lang: document.getElementById('stb_lang').value,
-          timezone: document.getElementById('timezone').value,
-          user_agent: document.getElementById('ua').value,
-          accept_language: document.getElementById('al').value
-        }
-        const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-        const j = await r.json(); show(r.ok ? 'Saved\\n'+JSON.stringify(j,null,2) : 'Error: '+(j.error||''))
-      }
-      async function test(){
-        const body = {
-          portal_url: document.getElementById('portal').value,
-          mac: document.getElementById('mac').value
-        }
-        show('Testing...')
-        const r = await fetch('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-        const j = await r.json(); show(r.ok ? JSON.stringify(j,null,2) : 'Error: '+(j.error||''))
-      }
-    </script>
-  `)
+  const proto = req.socket.encrypted ? 'https' : 'http'; const host = req.headers.host
+  res.type('html').send(`<!doctype html><meta charset="utf-8"><title>Configure Stalker Portal</title>
+<style>body{font-family:sans-serif;max-width:820px;margin:40px auto;padding:0 16px}label{display:block;margin-top:10px}input{width:100%;padding:8px}button{margin-top:12px;padding:8px 14px}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}</style>
+<h2>Stalker IPTV Configuration</h2>
+<label>Portal URL</label><input id="portal" value="${userConfig.portal_url}" placeholder="http://host/stalker_portal/server/load.php" />
+<div class="row">
+  <div><label>MAC Address</label><input id="mac" value="${userConfig.mac}" placeholder="00:1A:79:12:34:56" /></div>
+  <div><label>Prehash (optional)</label><input id="prehash" value="${userConfig.prehash || ''}" placeholder="EF92F..." /></div>
+</div>
+<div class="row">
+  <div><label>stb_lang</label><input id="stb_lang" value="${userConfig.stb_lang}" placeholder="en_IN" /></div>
+  <div><label>timezone</label><input id="timezone" value="${userConfig.timezone}" placeholder="Asia/Kolkata" /></div>
+</div>
+<div class="row">
+  <div><label>User-Agent</label><input id="ua" value="${userConfig.user_agent}" /></div>
+  <div><label>Accept-Language</label><input id="al" value="${userConfig.accept_language}" /></div>
+</div>
+<div><button onclick="save()">Save</button> <button onclick="test()">Test</button></div>
+<pre id="out"></pre>
+<p>Manifest URL: <code>${proto}://${host}/manifest.json</code></p>
+<script>
+  const out = document.getElementById('out'); function show(m){ out.textContent = m }
+  async function save(){
+    const body = {
+      portal_url: document.getElementById('portal').value,
+      mac: document.getElementById('mac').value,
+      prehash: document.getElementById('prehash').value,
+      stb_lang: document.getElementById('stb_lang').value,
+      timezone: document.getElementById('timezone').value,
+      user_agent: document.getElementById('ua').value,
+      accept_language: document.getElementById('al').value
+    }
+    const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    const j = await r.json(); show(r.ok ? 'Saved\\n'+JSON.stringify(j,null,2) : 'Error: '+(j.error||''))
+  }
+  async function test(){
+    const body = { portal_url: document.getElementById('portal').value, mac: document.getElementById('mac').value }
+    show('Testing...')
+    const r = await fetch('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    const j = await r.json(); show(r.ok ? JSON.stringify(j,null,2) : 'Error: '+(j.error||''))
+  }
+</script>`)
 })
 
 app.get('/api/config', (_req, res) => res.json(userConfig))
 
-app.post('/api/config', (req, res) => {
+// Save config → refresh genres; DO NOT blindly bump version here
+app.post('/api/config', async (req, res) => {
   const { portal_url, mac, prehash, stb_lang, timezone, user_agent, accept_language } = req.body || {}
   if (!portal_url || !mac) return res.status(400).json({ error: 'Missing portal_url or mac' })
-  userConfig.portal_url = ensureLoadPhp(portal_url)
-  userConfig.mac = mac
+  userConfig.portal_url = ensureLoadPhp(portal_url); userConfig.mac = mac
   if (prehash !== undefined) userConfig.prehash = prehash
   if (stb_lang) userConfig.stb_lang = stb_lang
   if (timezone) userConfig.timezone = timezone
   if (user_agent) userConfig.user_agent = user_agent
   if (accept_language) userConfig.accept_language = accept_language
-  try { saveConfig() } catch {}
-  tokenCache.clear()
+  saveConfig(); tokenCache.clear()
+  try { await refreshGenres() } catch (e) { console.warn('refreshGenres after /api/config failed:', e?.message) }
   res.json(userConfig)
 })
 
-app.post('/api/test', async (req, res) => {
-  const { portal_url, mac } = req.body || {}
-  if (!portal_url || !mac) return res.status(400).json({ error: 'Missing portal_url or mac' })
+// Kick a first refresh (non-blocking outcome; manifest already serves placeholder)
+await refreshGenres()
+
+// ---------- Addon handlers ----------
+const builder = new addonBuilder(builderManifest)
+
+async function getChannelsByGenre(baseUrl, mac, token, genreId) {
+  const id = String(genreId)
+  const attempts = [['get_all_channels', { genre_id: id }], ['get_all_channels', { tv_genre_id: id }], ['get_all_channels', { category_id: id }], ['get_all_channels', { cat_id: id }], ['get_all_channels', { catid: id }], ['get_all_channels', { group_id: id }], ['get_channels', { genre_id: id }], ['get_channels', { tv_genre_id: id }], ['get_channels', { category_id: id }], ['get_channels', { cat_id: id }], ['get_channels', { catid: id }], ['get_channels', { group_id: id }]]
+  const types = ['stb', 'itv']
+  for (const [action, params] of attempts) for (const t of types) {
+    try { const r = await doRequest({ portalUrl: baseUrl, mac, action, token, params, includeTokenParam: true, includePrehashParam: true, type: t })
+      const list = pickList(r); console.log('[ChannelsByGenre] try', action, params, 'type=', t, '→', Array.isArray(list) ? list.length : 'null'); if (Array.isArray(list) && list.length) return list } catch {}
+  }
+  for (const t of types) {
+    try { const rAll = await doRequest({ portalUrl: baseUrl, mac, action: 'get_all_channels', token, params: {}, includeTokenParam: true, includePrehashParam: true, type: t })
+      const all = pickList(rAll); if (!Array.isArray(all) || !all.length) continue
+      const keys = ['genre_id', 'tv_genre_id', 'category_id', 'cat_id', 'catid', 'group_id', 'tv_genre', 'categoryid','genre','category','categ','categ_id','group','grp_id','section_id','tag_id']
+      const filtered = all.filter(ch => keys.some(k => ch?.[k] != null && String(ch[k]) === id))
+      console.log('[ChannelsByGenre] fallback (client-filter) size=', filtered.length, 'of', all.length); if (filtered.length) return filtered } catch {}
+  } return []
+}
+function pickLogo(ch) { return ch.logo || ch.icon || ch.img || ch.image || null }
+
+builder.defineCatalogHandler(async ({ id, type = 'tv', extra = {}, skip = 0, limit = 100 }) => {
+  if (id !== 'stalker_live') { console.warn('[Catalog] Wrong id:', id, '(expected stalker_live)'); return { metas: [] } }
+  if (!ensureConfigured()) { console.warn('[Catalog] Not configured yet; returning empty metas.'); return { metas: [] } }
+  if (!_genres || !_genres.length || _genreByTitle.size === 0) { try { await refreshGenres() } catch {} }
+
+  let selectedRaw =
+    (extra && (extra.genre ?? extra.Genre ?? extra.category ?? extra.Category)) ??
+    (Array.isArray(extra?.genres) && extra.genres[0]) ??
+    (Array.isArray(extra?.genre)  && extra.genre[0])  ??
+    extra?.search ?? ''
+  try { if (typeof selectedRaw === 'string') selectedRaw = decodeURIComponent(selectedRaw) } catch {}
+  let selected = Array.isArray(selectedRaw) ? selectedRaw[0] : selectedRaw
+  const isNoop = selected === undefined || selected === null || selected === '' || selected === false || selected === true || (typeof selected === 'string' && /^(all|\*|none|false|null|undefined)$/i.test(selected.trim()))
+  if (isNoop || /^(all)$/i.test(String(selected||'').trim())) {
+    const portal = ensureLoadPhp(userConfig.portal_url); const mac = userConfig.mac; const token = await getTokenFor(portal, mac)
+    console.log('[Catalog] No/All genre selected — returning all channels (preview).')
+    const payload = await getAllChannels(portal, mac, token)
+    const all = extractChannelList(payload)
+    const metasAll = Array.isArray(all) ? all.map(ch => ({
+      id: `stalker:${encodeURIComponent(portal)}|${mac}|${encodeURIComponent(ch.cmd || String(ch.id))}`,
+      type: 'tv', name: ch.name || `CH ${ch.id}`, poster: pickLogo(ch), description: ch.cmd || ''
+    })) : []
+    const s = Math.max(0, Number(skip) || 0); const l = Math.max(1, Number(limit) || 100); const metas = metasAll.slice(s, s + l)
+    return { metas }
+  }
+  selected = String(selected).trim()
+
+  let rec = _genreByTitle.get(_gfNormName(selected))
+  if (!rec) { const title = _genreById.get(String(selected)); if (title) rec = _genreByTitle.get(_gfNormName(title)) }
+  if (!rec) { console.warn('[Catalog] Unknown genre:', selected, '| known count:', _genreByTitle.size); return { metas: [] } }
+
+  const portal = ensureLoadPhp(userConfig.portal_url); const mac = userConfig.mac; const token = await getTokenFor(portal, mac)
+  console.log('[Catalog] Selected genre =', selected, '→ id =', rec.id)
+  const list = await getChannelsByGenre(portal, mac, token, rec.id)
+  const metasAll = Array.isArray(list) ? list.map(ch => ({
+    id: `stalker:${encodeURIComponent(portal)}|${mac}|${encodeURIComponent(ch.cmd || String(ch.id))}`,
+    type: 'tv', name: ch.name || `CH ${ch.id}`, poster: pickLogo(ch), description: ch.cmd || '', genres: [selected],
+  })) : []
+  const s = Math.max(0, Number(skip) || 0); const l = Math.max(1, Number(limit) || 100); const metas = metasAll.slice(s, s + l)
+  console.log('[Catalog] Returning metas:', metas.length); return { metas }
+})
+
+function parsePackedId(id) {
+  const raw = id.startsWith('stalker:') ? id.slice('stalker:'.length) : id
+  const [encPortal = '', mac = '', encCmd = ''] = raw.split('|')
+  let portal = encPortal, cmd = encCmd; try { portal = decodeURIComponent(encPortal) } catch {}; try { cmd = decodeURIComponent(encCmd) } catch {}
+  const bareCmdUrl = (typeof cmd === 'string' && cmd.startsWith('ffmpeg ')) ? cmd.slice('ffmpeg '.length) : cmd
+  return { portal, mac, cmd, bareCmdUrl }
+}
+async function createLink(baseUrl, mac, token, cmd) { return await doRequest({ portalUrl: baseUrl, mac, action: 'create_link', token, params: { cmd }, includeTokenParam: true, includePrehashParam: true, type: 'stb' }) }
+
+builder.defineStreamHandler(async ({ id }) => {
   try {
-    const portal = ensureLoadPhp(portal_url)
-    const hs = await handshake(portal, mac)
-    const token = extractToken(hs) || ''
-    const ch = await getAllChannels(portal, mac, token)
-    const arr = extractChannelList(ch)
-    res.json({ ok: true, handshake: hs, token, channels_count: arr.length })
+    if (!id || !id.startsWith('stalker:')) return { streams: [] }
+    const { portal, mac, cmd, bareCmdUrl } = parsePackedId(id)
+    const token = await getTokenFor(portal, mac)
+    const resp = await createLink(portal, mac, token, bareCmdUrl || cmd)
+    console.log('[Stream] create_link keys:', Object.keys(resp || {}))
+    const finalUrl = (typeof cmd === 'string' && cmd.startsWith('ffmpeg ')) ? cmd.slice('ffmpeg '.length) : cmd
+    return { streams: finalUrl ? [{ url: finalUrl, title: 'Stalker Portal' }] : [] }
+  } catch (e) { console.error('[Stream] error:', e?.message); return { streams: [] } }
+})
+
+async function getAllChannels(baseUrl, mac, token) { return await doRequest({ portalUrl: baseUrl, mac, action: 'get_all_channels', token, params: {}, includeTokenParam: true, includePrehashParam: true, type: 'itv' }) }
+builder.defineMetaHandler(async ({ type, id }) => {
+  try {
+    if (!id) return { meta: null }
+    const raw = id.startsWith('stalker:') ? id.slice('stalker:'.length) : id
+    const [encPortal = '', mac = '', encCmd = ''] = raw.split('|')
+    let portal = encPortal, cmd = encCmd; try { portal = decodeURIComponent(encPortal) } catch {}; try { cmd = decodeURIComponent(encCmd) } catch {}
+    let name = 'Live Channel', poster = null, description = cmd || ''
+    try {
+      if (portal && mac) {
+        const token   = await getTokenFor(portal, mac)
+        const payload = await getAllChannels(portal, mac, token)
+        const arr = extractChannelList(payload)
+        const found = arr.find(ch => (ch?.cmd || String(ch?.id ?? '')) === cmd)
+        if (found) { name = found.name || name; poster = found.logo || poster; if (!description && found.cmd) description = found.cmd }
+      }
+    } catch (e) { console.warn('[META] enrichment failed:', e?.message) }
+    return { meta: { id, type: 'tv', name, poster, description, logo: poster || null, background: poster || null, releaseInfo: 'Stalker IPTV' } }
+  } catch (e) { console.error('[META] error:', e?.message); return { meta: { id: id || '', type: 'tv', name: 'Live Channel', description: '' } } }
+})
+
+// Build interface & debug helpers
+const iface = builder.getInterface()
+
+// Debug: list portal genres with ids (useful to test catalog params)
+app.get('/api/genres', (_req, res) => {
+  try {
+    const out = []
+    if (globalThis._genres && Array.isArray(globalThis._genres)) {
+      for (const g of globalThis._genres) {
+        const id = (g.id ?? g._id ?? g.tv_genre_id ?? g.category_id ?? g.cat_id ?? g.catid ?? g.group_id ?? g.categoryid ?? g.tv_genre ?? g.genre_id ?? g.uid ?? g.value ?? g.key ?? g.Id ?? g.ID ?? g.i)
+        const title = (g.title ?? g.name ?? g.category ?? g.genre ?? g.text ?? g.label ?? g.Title ?? g.Name ?? g.t)
+        out.push({ id, title })
+      }
+    }
+    res.json({ count: out.length, genres: out })
   } catch (e) {
     res.status(500).json({ error: e?.message || String(e) })
   }
 })
 
-app.get('/healthz', (_req, res) => res.status(200).send('ok'))
+// Mount Stremio router last
+app.use('/', getRouter(iface))
 
-// mount Stremio routes
-const router = getRouter(iface)
-app.use('/', router)
-
-/* ───────────────────────── HTTPS / HTTP ───────────────────────── */
+// ---------- Server ----------
 const HOST = process.env.HOST || '0.0.0.0'
 const PORT = Number(process.env.PORT || 7100)
 const SSL_KEY  = process.env.SSL_KEY  || ''
@@ -629,21 +447,9 @@ const SSL_CERT = process.env.SSL_CERT || ''
 const SSL_CA   = process.env.SSL_CA   || ''
 
 function startHttps() {
-  const opts = {
-    key:  fs.readFileSync(SSL_KEY),
-    cert: fs.readFileSync(SSL_CERT),
-    ...(SSL_CA ? { ca: fs.readFileSync(SSL_CA) } : {})
-  }
+  const opts = { key: fs.readFileSync(SSL_KEY), cert: fs.readFileSync(SSL_CERT), ...(SSL_CA ? { ca: fs.readFileSync(SSL_CA) } : {}) }
   const server = https.createServer(opts, app)
   server.listen(PORT, HOST, () => console.log(`🔐 HTTPS on https://${HOST}:${PORT}/configure`))
 }
-if (SSL_KEY && SSL_CERT) {
-  try { startHttps() }
-  catch (e) {
-    console.error('HTTPS failed, fallback to HTTP:', e?.message)
-    app.listen(PORT, HOST, () => console.log(`🌐 HTTP on http://${HOST}:${PORT}/configure`))
-  }
-} else {
-  app.listen(PORT, HOST, () => console.log(`🌐 HTTP on http://${HOST}:${PORT}/configure`))
-}
-
+if (SSL_KEY && SSL_CERT) { try { startHttps() } catch (e) { console.error('HTTPS failed, fallback to HTTP:', e?.message); app.listen(PORT, HOST, () => console.log(`🌐 HTTP on http://${HOST}:${PORT}/configure`)) } }
+else { app.listen(PORT, HOST, () => console.log(`🌐 HTTP on http://${HOST}:${PORT}/configure`)) }
