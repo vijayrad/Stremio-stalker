@@ -1,6 +1,6 @@
 {
-  "portal_url": "http://example.com?type=stb&action=handshake",
-  "mac": "00:1A:79:74:8E:FB",
+  "portal_url": "http://tv.premiumplus.tv:80",
+  "mac": "00:1A:79:B6:22:CF",
   "stb_lang": "en_IN",
   "timezone": "Asia/Kolkata",
   "user_agent": "StalkerTV-Free/40304.13 CFNetwork/3860.200.31 Darwin/25.1.0",
