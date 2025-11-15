@@ -1,5 +1,5 @@
 {
-  "portal_url": "http:example.com?type=stb&action=handshake",
+  "portal_url": "http://example.com?type=stb&action=handshake",
   "mac": "00:1A:79:74:8E:FB",
   "stb_lang": "en_IN",
   "timezone": "Asia/Kolkata",
